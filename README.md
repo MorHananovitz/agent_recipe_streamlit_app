@@ -150,6 +150,3 @@ agent_recipe_streamlit_app/
 
 Contributions are welcome! Please feel free to open an issue or submit a pull request.
 
-## License
-
-This project is licensed under the Apache 2.0 License - see the LICENSE file for details.
