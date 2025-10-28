@@ -1,0 +1,225 @@
+import logging
+from typing import Dict, Any, List
+from langchain.schema import SystemMessage, HumanMessage
+from langchain_openai import ChatOpenAI
+from langchain_community.tools.tavily_search.tool import TavilySearchResults
+from langgraph.graph import END
+from recipe_app.models.recipe_models import (
+    RecipeState, 
+    ResponseRecipeKeyFeatures, 
+    HumanSelection,
+    RecipeFeature
+)
+from recipe_app.config.config import (
+    MODEL_NAME, 
+    TEMPERATURE, 
+    MAX_SEARCH_RESULTS,
+    SEARCH_INSTRUCTIONS,
+    RECIPE_FEATURES_INSTRUCTIONS,
+    TAVILY_API_KEY
+)
+import streamlit as st
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class QueryTranslator:
+    """Transforms human messages into structured web queries using LLM."""
+
+    @staticmethod
+    def translate(state: RecipeState) -> RecipeState:
+        try:
+            logger.info("Starting query translation")
+            llm = ChatOpenAI(model=MODEL_NAME, temperature=TEMPERATURE)
+            messages = state.get("messages", [])
+            
+            # Update system message to request just the search query
+            system_message = SystemMessage(content=SEARCH_INSTRUCTIONS + "\nProvide ONLY the search query without any additional text or explanation.")
+            response = llm.invoke([system_message] + messages)
+            
+            # Extract just the query text, removing any quotes
+            query = response.content.strip().strip('"').strip("'")
+            state["query"] = query
+            
+            logger.info(f"Query translated: {query}")
+            return state
+        except Exception as e:
+            logger.error(f"Error in query translation: {str(e)}")
+            raise
+
+class RecipeRetriever:
+    """Retrieves recipes using Tavily search."""
+
+    @staticmethod
+    def _search_recipes(query: str) -> list:
+        """Search function that retrieves recipes."""
+        logger.info(f"Performing search for query: {query}")
+        tavily_search = TavilySearchResults(max_results=MAX_SEARCH_RESULTS)
+        search_docs = tavily_search.run(query)
+        return [
+            {
+                "name": doc.get("title", "Unknown Dish"),
+                "url": doc["url"],
+                "content": doc["content"]
+            }
+            for doc in search_docs
+        ]
+
+    @staticmethod
+    def retrieve(state: RecipeState) -> RecipeState:
+        try:
+            logger.info("Starting recipe retrieval")
+            query = state.get("query", "")
+            
+            if not query:
+                logger.error("No query provided")
+                state['recipes'] = []
+                return state
+            
+            # Try to use Streamlit caching if available, otherwise just call directly
+            try:
+                formatted_search_recipes = st.cache_data(ttl=3600)(RecipeRetriever._search_recipes)(query)
+            except (NameError, RuntimeError):
+                # Not in Streamlit context, call directly
+                formatted_search_recipes = RecipeRetriever._search_recipes(query)
+            
+            state['recipes'] = formatted_search_recipes
+            logger.info(f"Retrieved {len(formatted_search_recipes)} recipes")
+            return state
+        except Exception as e:
+            logger.error(f"Error in recipe retrieval: {str(e)}")
+            state['recipes'] = []
+            return state
+
+class RecipeKeyFeatures:
+    """Extracts key features from the retrieved recipes."""
+
+    @staticmethod
+    def _extract_features(recipes_str: str) -> List[RecipeFeature]:
+        """Extraction function that extracts key features from recipes."""
+        logger.info("Performing feature extraction")
+        llm = ChatOpenAI(model=MODEL_NAME, temperature=TEMPERATURE)
+        structured_llm = llm.with_structured_output(ResponseRecipeKeyFeatures)
+        key_features = structured_llm.invoke([
+            SystemMessage(content=RECIPE_FEATURES_INSTRUCTIONS),
+            HumanMessage(content=recipes_str)
+        ])
+        return key_features.results
+
+    @staticmethod
+    def extract(state: RecipeState) -> RecipeState:
+        try:
+            logger.info("Starting feature extraction")
+            
+            if not state.get('recipes'):
+                logger.warning("No recipes to extract features from")
+                state['key_features'] = []
+                return state
+            
+            # Convert recipes to a string for caching
+            formatted_docs = "\n\n".join([
+                f"Recipe: {doc['name']}\nContent: {doc['content']}"
+                for doc in state['recipes']
+            ])
+            
+            # Try to use Streamlit caching if available, otherwise just call directly
+            try:
+                features = st.cache_data(ttl=3600)(RecipeKeyFeatures._extract_features)(formatted_docs)
+            except (NameError, RuntimeError):
+                # Not in Streamlit context, call directly
+                features = RecipeKeyFeatures._extract_features(formatted_docs)
+            
+            state['key_features'] = features
+            logger.info("Feature extraction completed")
+            return state
+        except Exception as e:
+            logger.error(f"Error in feature extraction: {str(e)}")
+            state['key_features'] = []
+            return state
+
+class HumanFeedback:
+    """Processes user feedback on recipes."""
+
+    @staticmethod
+    def refine(state: RecipeState) -> Dict[str, Any]:
+        try:
+            logger.info("Processing user feedback")
+            
+            # Get user feedback from state
+            user_feedback = state.get("feedback")
+            
+            # If no feedback provided, this is the first pass - just set defaults and end
+            if not user_feedback:
+                if 'recipes_index' not in state:
+                    state['recipes_index'] = -1
+                # Mark that we've processed (no feedback to process)
+                state['feedback_processed'] = True
+                logger.info("No feedback to process - ending current iteration")
+                return state
+
+            # We have feedback - process it
+            llm = ChatOpenAI(model=MODEL_NAME, temperature=TEMPERATURE)
+            system_message = SystemMessage(content=f"""
+            Process the user feedback on the suggested recipes:
+            Current recipes: {state.get('key_features', [])}
+            User feedback: {user_feedback}
+
+            Instructions:
+            1. If the user expresses satisfaction with any recipe, return its index (0, 1, or 2).
+            2. If the user wants modifications or different recipes, explain why in the dislike field.
+            3. Be strict about recipe selection - only set 'like' if there's clear positive feedback.
+            """)
+
+            structured_llm = llm.with_structured_output(HumanSelection)
+            classification = structured_llm.invoke([system_message])
+
+            if classification.like is not None:
+                state['recipes_index'] = classification.like
+                logger.info(f"User selected recipe {classification.like}")
+            else:
+                state['recipes_index'] = -1
+                state["messages"] = [HumanMessage(content=classification.dislike)]
+                logger.info(f"User requested modifications: {classification.dislike}")
+            
+            # Clear feedback after processing to prevent loops
+            state["feedback"] = None
+            state['feedback_processed'] = True
+            return state
+        except Exception as e:
+            logger.error(f"Error in feedback processing: {str(e)}")
+            if 'recipes_index' not in state:
+                state['recipes_index'] = -1
+            state['feedback_processed'] = True
+            return state
+
+class Satisfaction:
+    """Determines if the user is satisfied with the recipe selection."""
+
+    @staticmethod
+    def recipe_satisfaction(state: RecipeState) -> str:
+        try:
+            # Get recipes_index with default value of -1
+            recipes_index = state.get('recipes_index', -1)
+            
+            # Check if a recipe was selected
+            if recipes_index >= 0:
+                logger.info(f"User satisfied with recipe {recipes_index}")
+                return END
+            
+            # Check if we have actual user feedback to process
+            has_feedback = state.get('feedback') is not None and state.get('feedback') != ''
+            
+            # If we have explicit feedback, restart the query
+            if has_feedback:
+                logger.info("Processing user feedback - restarting query")
+                return "translate_query"
+            
+            # Default: end if no feedback
+            logger.info("No feedback - ending current iteration")
+            return END
+                
+        except Exception as e:
+            logger.error(f"Error in satisfaction check: {str(e)}")
+            # On error, end current iteration
+            return END 
