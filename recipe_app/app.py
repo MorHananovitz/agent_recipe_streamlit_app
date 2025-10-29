@@ -106,7 +106,15 @@ def main():
     # Apply custom CSS styling
     apply_custom_css()
     
-    st.title(f"{PAGE_ICON} {PAGE_TITLE}")
+    # Create header with aligned New Chat button
+    header_col1, header_col2 = st.columns([4, 1])
+    with header_col1:
+        st.title(f"{PAGE_ICON} {PAGE_TITLE}")
+    with header_col2:
+        st.markdown("<br>", unsafe_allow_html=True)  # Add spacing to align with title
+        if st.button("🔄 New Chat", key="header_new_chat"):
+            reset_chat()
+            st.rerun()
 
     # API Keys input section
     with st.sidebar:
@@ -115,7 +123,7 @@ def main():
         tavily_api_key = st.text_input("Tavily API Key", type="password", key="tavily_api_key")
         
         if not openai_api_key or not tavily_api_key:
-            st.warning("Please enter your API keys to use the application.")
+            st.markdown('<p style="color: black;">Please enter your API keys to use the application.</p>', unsafe_allow_html=True)
             st.stop()
         
         # Set the API keys in environment
@@ -256,12 +264,6 @@ def main():
 
     # Right column for tips and info
     with right_col:
-        # New Chat button at the top
-        if st.button("🔄 New Chat", use_container_width=True):
-            reset_chat()
-            st.rerun()
-        
-        st.markdown("---")
         st.markdown("### 💡 How to Use")
         st.markdown("""
         1. **Enter your ingredients** or recipe request
